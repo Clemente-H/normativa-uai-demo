@@ -29,7 +29,7 @@ MODELOS = [
     "anthropic/claude-sonnet-5.5",
 ]
 MAX_CALLS = int(os.environ.get("MAX_CALLS", "400"))
-UMBRAL = 88  # similitud mínima (0-100) para dar una cita por verificada
+UMBRAL = 85  # similitud mínima (0-100) para dar una cita por verificada
 
 st.set_page_config(page_title="Asistente de normativa UAI", page_icon=":material/gavel:", layout="wide")
 
@@ -119,22 +119,39 @@ def llamar(modelo: str, years: list[int], mensajes: list[dict], formato: str) ->
             model=modelo,
             messages=[{"role": "system", "content": system}, *mensajes],
             temperature=0,
-            max_tokens=1500,
+            max_tokens=4000,
             extra_headers={"X-Title": "Demo normativa UAI"},
+            extra_body={"reasoning": {"effort": "low"}, "usage": {"include": True}},
         )
         texto = r.choices[0].message.content or ""
+        costo = getattr(r, "usage", None) and (r.usage.model_extra or {}).get("cost")
+        if costo:
+            with reg["lock"]:
+                reg["costo"] = reg.get("costo", 0.0) + float(costo)
     except Exception as e:  # noqa: BLE001
         return {"estado": "error", "respuesta": f"Error al consultar el modelo: {e}", "citas": []}
     return parsear(texto)
 
 
 def parsear(texto: str) -> dict:
-    t = re.sub(r"^```(?:json)?|```$", "", texto.strip(), flags=re.M).strip()
-    ini, fin = t.find("{"), t.rfind("}")
-    try:
-        return json.loads(t[ini : fin + 1])
-    except Exception:  # noqa: BLE001
-        return {"estado": "parcial", "respuesta": texto, "citas": []}
+    t = re.sub(r"```(?:json)?", "", texto).strip()
+    ini = t.find("{")
+    if ini >= 0:
+        try:
+            obj, _ = json.JSONDecoder(strict=False).raw_decode(t[ini:])
+            if isinstance(obj, dict):
+                return obj
+        except Exception:  # noqa: BLE001
+            pass
+        m = re.search(r'"respuesta"\s*:\s*"((?:[^"\\]|\\.)*)', t, flags=re.S)
+        if m:
+            try:
+                resp = json.loads('"' + m.group(1) + '"', strict=False)
+            except Exception:  # noqa: BLE001
+                resp = m.group(1)
+            est = re.search(r'"estado"\s*:\s*"([a-zñ_]+)"', t)
+            return {"estado": est.group(1) if est else "parcial", "respuesta": resp, "citas": []}
+    return {"estado": "parcial", "respuesta": texto, "citas": []}
 
 
 # ---------------------------------------------------------------- verificación de citas
@@ -406,13 +423,14 @@ with tab_panel:
         items = list(reg["items"])
     st.markdown("#### Panel del asistente")
     st.caption("Compartido en vivo entre todas las personas conectadas. Solo guarda la pregunta, nunca quién la hizo.")
-    m1, m2, m3, m4 = st.columns(4)
+    m1, m2, m3, m4, m5 = st.columns(5)
     total_c = sum(i["citas"] for i in items)
     ok_c = sum(i["verificadas"] for i in items)
     m1.metric("Preguntas", len(items))
     m2.metric("Citas verificadas", f"{(100 * ok_c / total_c):.0f}%" if total_c else "—")
     m3.metric("Sin respuesta en documentos", sum(1 for i in items if i["estado"] == "no_esta"))
     m4.metric("Pulgar abajo", sum(1 for i in items if i["feedback"] == "negativo"))
+    m5.metric("Gasto del modelo", f"US$ {reg.get('costo', 0.0):.2f}")
 
     st.markdown("##### Registro de fallas")
     st.caption("Preguntas que los documentos no responden o que alguien marcó como incorrectas. Es la lista de trabajo para quien mantiene los documentos.")
