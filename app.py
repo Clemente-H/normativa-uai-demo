@@ -23,9 +23,9 @@ from rapidfuzz import fuzz
 
 DATA = Path(__file__).parent / "data"
 MODELOS = [
+    "deepseek/deepseek-v4.1-flash",
     "anthropic/claude-haiku-5.5",
     "google/gemini-3.8-flash",
-    "deepseek/deepseek-v4.1-flash",
     "anthropic/claude-sonnet-5.5",
 ]
 MAX_CALLS = int(os.environ.get("MAX_CALLS", "400"))
