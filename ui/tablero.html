@@ -1,0 +1,79 @@
+<div class="app" data-theme="light">
+<header>
+  <div class="brand">
+    <div class="mark">UAI</div>
+    <div><h1>Normativa académica de pregrado</h1><p>Prototipo del Grupo 15 ConectIA | demo CENIA, no es un sitio oficial UAI</p></div>
+  </div>
+  <div class="spacer"></div>
+  <div class="toggle" role="group" aria-label="Tema">
+    <button data-t="light">Claro UAI</button><button data-t="dark">Sala de control</button>
+  </div>
+</header>
+
+<section class="cohort">
+  <div><div class="lbl">Promoción de ingreso</div><div class="year" id="yearBig">2025</div></div>
+  <div class="track" id="track"><div class="fill" id="trackFill"></div></div>
+  <button class="play" id="play"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg><span>Ver la evolución</span></button>
+</section>
+
+<section class="kpis">
+  <div class="kpi"><b>8</b><span>compilados oficiales, 2018 a 2025</span></div>
+  <div class="kpi pri"><b id="kTram">12</b><span>trámites mapeados en esta cohorte</span></div>
+  <div class="kpi"><b id="kVer">0</b><span>citas verificadas contra el PDF</span></div>
+  <div class="kpi acc"><b id="kChg">0</b><span>cambios de responsable vs año anterior</span></div>
+  <div class="kpi" id="kpiFail"><b id="kFail">0</b><span>preguntas sin respuesta en los documentos</span></div>
+</section>
+
+<main>
+  <div class="col">
+    <section class="card" id="cardGraph">
+      <div class="card-h">
+        <div><h2>Quién decide qué</h2><p class="sub">Cargos y trámites según el reglamento de la promoción <b id="yGraph">2025</b>. Toca un cargo o un trámite.</p></div>
+        <span class="tag pri" id="graphTag">12 trámites</span>
+      </div>
+      <div class="graphwrap">
+        <svg class="graph" id="graph" viewBox="0 0 720 520" aria-label="Mapa de cargos y trámites"></svg>
+        <div class="detail" id="detail"></div>
+      </div>
+    </section>
+
+    <section class="card" id="cardTime">
+      <div class="card-h">
+        <div><h2>La norma en el tiempo</h2><p class="sub">Quién decide cada trámite en cada promoción. El punto marca un cambio respecto del año anterior.</p></div>
+        <span class="tag acc" id="timeTag">0 cambios</span>
+      </div>
+      <div style="overflow-x:auto"><table class="matrix" id="matrix"></table></div>
+      <div class="legend" id="legend"></div>
+    </section>
+
+    <section class="card" id="cardFinds">
+      <div class="card-h">
+        <div><h2>Hallazgos del auditor</h2><p class="sub">Contradicciones, vacíos y referencias rotas encontradas al cruzar los documentos. La IA propone, una persona confirma.</p></div>
+        <div class="filters" id="filters"></div>
+      </div>
+      <div class="finds" id="finds"></div>
+    </section>
+    <section class="card" id="cardLib">
+      <div class="card-h">
+        <div><h2>Biblioteca de documentos</h2><p class="sub">Todo lo que el asistente puede leer, con su estado de vigencia. Y lo que falta para el piloto.</p></div>
+        <span class="tag pri" id="libTag"></span>
+      </div>
+      <div class="libbar"><input id="libQ" placeholder="Buscar documento, cohorte o unidad…"><div class="filters" id="libF"></div></div>
+      <div class="libsum" id="libSum"></div>
+      <div class="lib" id="lib"></div>
+    </section>
+  </div>
+
+  <aside class="card chat" id="chat">
+    <div class="chat-h">
+      <h2>Pregúntale a la normativa</h2>
+      <div class="live"><i></i>Responde solo con los reglamentos y mueve el tablero</div>
+    </div>
+    <div class="msgs" id="msgs"></div>
+    <div class="chips" id="chips"></div>
+    <form class="composer" id="composer"><input id="inp" placeholder="Escribe tu pregunta…" autocomplete="off"><button>Enviar</button></form>
+  </aside>
+</main>
+<footer>Fuente: compilados de reglamentos de pregrado publicados por la UAI. Las citas se comprueban automáticamente contra el texto del PDF, sin IA. El chat responde con un modelo de lenguaje vía OpenRouter y cada cita se comprueba contra el PDF.</footer>
+
+</div>

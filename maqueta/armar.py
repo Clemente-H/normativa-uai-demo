@@ -100,3 +100,68 @@ html = (AQUI / "plantilla.html").read_text(encoding="utf-8")
 html = html.replace("/*__DATA__*/null", json.dumps(DATA, ensure_ascii=False))
 (AQUI / "index.html").write_text(html, encoding="utf-8")
 print("ok", len(html) // 1024, "KB")
+
+
+# ---------------------------------------------------------------- componente para Streamlit
+import re as _re
+
+UI = AQUI.parent / "ui"
+UI.mkdir(exist_ok=True)
+plantilla = (AQUI / "plantilla.html").read_text(encoding="utf-8")
+css = _re.search(r"<style>(.*?)</style>", plantilla, _re.S).group(1)
+css = css.replace(':root, :root[data-theme="light"]', '.app, .app[data-theme="light"]').replace(':root[data-theme="dark"]', '.app[data-theme="dark"]')
+css = css.replace("html, body { margin:0; }", "").replace("\nbody {", "\n.app {")
+css += "\n.app { min-height:100vh; } .app header { top:0; }\n"
+cuerpo = _re.search(r"<body>(.*?)<script>", plantilla, _re.S).group(1)
+cuerpo = cuerpo.replace("Maqueta: el chat usa respuestas pregrabadas y reales; en la app responde el modelo.", "El chat responde con un modelo de lenguaje vía OpenRouter y cada cita se comprueba contra el PDF.")
+html_comp = f'<div class="app" data-theme="light">{cuerpo}</div>'
+js = _re.search(r"<script>(.*?)</script>", plantilla, _re.S).group(1)
+js = js.replace("const DATA = /*__DATA__*/null;", "")
+js = js.replace("document.getElementById(", "$id(").replace("document.querySelectorAll(", "root.querySelectorAll(").replace("document.querySelector(", "root.querySelector(")
+js = js.replace("document.documentElement.dataset.theme", "APP.dataset.theme").replace("getComputedStyle(document.documentElement)", "getComputedStyle(APP)")
+viejo_ask = _re.search(r"function ask\(q\) \{.*?\n\}\n", js, _re.S).group(0)
+js = js.replace(viejo_ask, '''let pendiente = null, ultimoId = null;
+function ask(q) {
+  addUser(q);
+  pendiente = document.createElement("div"); pendiente.className = "msg a";
+  pendiente.innerHTML = '<span class="typing"><i></i><i></i><i></i></span><span class="meta">Leyendo el reglamento de la promoción ' + year + '…</span>';
+  msgs.appendChild(pendiente); msgs.scrollTop = msgs.scrollHeight;
+  send("pregunta", { id: Date.now() + "-" + Math.random().toString(36).slice(2, 7), q, año: year });
+}
+function recibir(d) {
+  if (d.stats) { const k = $id("kFail"); if (+k.textContent !== d.stats.sin_respuesta) k.textContent = d.stats.sin_respuesta; }
+  const r = d.respuesta; if (!r || r.id === ultimoId) return; ultimoId = r.id;
+  if (pendiente) { pendiente.remove(); pendiente = null; }
+  answer(r);
+}
+''')
+js_comp = """
+function init(root, DATA, send, primera) {
+  const $id = (id) => root.querySelector('#' + id);
+  const APP = root.querySelector('.app');
+""" + js + """
+  ultimoId = primera && primera.respuesta ? primera.respuesta.id : null;
+  recibir({ stats: primera && primera.stats });
+  return { recibir };
+}
+
+export default function (component) {
+  const { data, setTriggerValue, parentElement } = component;
+  parentElement.__send = setTriggerValue;
+  if (!document.getElementById('fuente-inter')) {
+    const l = document.createElement('link'); l.id = 'fuente-inter'; l.rel = 'stylesheet';
+    l.href = 'https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap';
+    document.head.appendChild(l);
+  }
+  if (!parentElement.__api) {
+    parentElement.__api = init(parentElement, data.base, (k, v) => parentElement.__send(k, v), data);
+  } else {
+    parentElement.__api.recibir(data);
+  }
+}
+"""
+(UI / "tablero.css").write_text(css, encoding="utf-8")
+(UI / "tablero.html").write_text(html_comp, encoding="utf-8")
+(UI / "tablero.js").write_text(js_comp, encoding="utf-8")
+(AQUI.parent / "data" / "tablero.json").write_text(json.dumps(DATA, ensure_ascii=False), encoding="utf-8")
+print("componente ok")

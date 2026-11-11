@@ -1,40 +1,58 @@
-"""Asistente de normativa académica UAI | demo Micropráctica 3 (CENIA).
+"""Normativa académica UAI | tablero + asistente (demo CENIA, Micropráctica 3).
 
-Chat con citas verificadas contra el PDF oficial, comparación entre cohortes y panel compartido.
-Variables de entorno: OPENROUTER_API_KEY (obligatoria), MAX_CALLS (tope de llamadas, por defecto 400).
+El tablero es un componente HTML (ui/). El chat le manda la pregunta a Python, Python consulta el modelo
+con el compilado de la promoción elegida más la matriz "quién decide qué" 2018-2025, verifica cada cita
+contra el texto del PDF sin IA y devuelve la respuesta con el foco que mueve el tablero.
+
+Secretos o variables: OPENROUTER_API_KEY (obligatoria), APP_PASSWORD (por defecto uaipassword1234),
+MODELO (por defecto deepseek/deepseek-v4.1-flash), MAX_CALLS (por defecto 600).
 """
 from __future__ import annotations
 
-import datetime as dt
-import html
 import json
 import os
 import re
 import threading
 import unicodedata
-import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-import pandas as pd
 import streamlit as st
 from openai import OpenAI
 from rapidfuzz import fuzz
 
-DATA = Path(__file__).parent / "data"
-MODELOS = [
-    "deepseek/deepseek-v4.1-flash",
-    "anthropic/claude-haiku-5.5",
-    "google/gemini-3.8-flash",
-    "anthropic/claude-sonnet-5.5",
-]
-MAX_CALLS = int(os.environ.get("MAX_CALLS", "400"))
+RAIZ = Path(__file__).parent
+DATA = RAIZ / "data"
+UI = RAIZ / "ui"
 UMBRAL = 85  # similitud mínima (0-100) para dar una cita por verificada
+HALLAZGO_POR_TRAMITE = {"convalidacion": "h2", "justificacion": "h6"}
 
-st.set_page_config(page_title="Asistente de normativa UAI", page_icon=":material/gavel:", layout="wide")
+st.set_page_config(page_title="Normativa UAI", page_icon=":material/gavel:", layout="wide", initial_sidebar_state="collapsed")
+
+
+def secreto(nombre: str, defecto: str | None = None) -> str | None:
+    v = os.environ.get(nombre)
+    if v:
+        return v
+    try:
+        return st.secrets.get(nombre, defecto)
+    except Exception:  # noqa: BLE001  (sin secrets.toml en local)
+        return defecto
+
+
+MODELO = secreto("MODELO", "deepseek/deepseek-v4.1-flash")
+MAX_CALLS = int(secreto("MAX_CALLS", "600"))
+CLAVE_APP = secreto("APP_PASSWORD", "uaipassword1234")
 
 
 # ---------------------------------------------------------------- datos y estado compartido
+def normalizar(t: str) -> str:
+    t = unicodedata.normalize("NFKC", t).lower()
+    t = re.sub(r"-\s*\n\s*", "", t)
+    t = re.sub(r"[\"“”«»']", "", t)
+    return re.sub(r"\s+", " ", t).strip()
+
+
 @st.cache_resource
 def cargar_corpus() -> dict[int, dict]:
     corpus = {}
@@ -47,90 +65,50 @@ def cargar_corpus() -> dict[int, dict]:
 
 
 @st.cache_resource
+def cargar_tablero() -> dict:
+    return json.loads((DATA / "tablero.json").read_text(encoding="utf-8"))
+
+
+@st.cache_resource
+def matriz_texto() -> str:
+    t = cargar_tablero()
+    nombres = {x["id"]: x["nombre"] for x in t["tramites"]}
+    lineas = ["TABLA VERIFICADA: QUIÉN DECIDE CADA TRÁMITE, POR PROMOCIÓN DE INGRESO (2018 a 2025)"]
+    for y in sorted(t["por_año"]):
+        for it in t["por_año"][y]:
+            alt = f" o {it['decide_alt']}" if it.get("decide_alt") else ""
+            lineas.append(
+                f"{y} | {it['id']} ({nombres[it['id']]}) | decide: {it.get('decide') or 'No indicado'}{alt} | "
+                f"{it.get('reglamento') or ''}, {it.get('articulo') or ''}, p. {it.get('pagina_real') or it.get('pagina')} | "
+                f'frase: "{it.get("cita") or ""}"'
+            )
+    return "\n".join(lineas)
+
+
+@st.cache_resource
 def registro() -> dict:
-    """Estado compartido entre todas las sesiones (todos ven el mismo panel)."""
-    return {"items": [], "lock": threading.Lock(), "calls": 0}
+    """Estado compartido entre todas las sesiones."""
+    return {"lock": threading.Lock(), "calls": 0, "costo": 0.0, "preguntas": 0, "sin_respuesta": 0}
 
 
-def normalizar(t: str) -> str:
-    t = unicodedata.normalize("NFKC", t).lower()
-    t = re.sub(r"-\s*\n\s*", "", t)  # palabras cortadas al final de línea
-    t = re.sub(r"[\"“”«»']", "", t)
-    return re.sub(r"\s+", " ", t).strip()
-
-
-def contexto(years: list[int]) -> str:
-    corpus = cargar_corpus()
-    partes = []
-    for y in years:
-        d = corpus[y]
-        partes.append(f"<<<DOCUMENTO: {d['titulo']} (aplica a quienes ingresaron en {y})>>>")
-        for p in d["pages"]:
-            partes.append(f"=== Compilado {y} | Página {p['page']} ===\n{p['text']}")
-    return "\n\n".join(partes)
-
-
-# ---------------------------------------------------------------- prompts
-INSTRUCCIONES = """Eres el asistente de normativa académica de pregrado de la Universidad Adolfo Ibáñez para docentes y personal administrativo de la Facultad de Comunicaciones.
-Responde usando SOLO los documentos entregados, sin conocimiento externo.
+# ---------------------------------------------------------------- modelo
+INSTRUCCIONES = """Eres el asistente de normativa académica de pregrado de la Universidad Adolfo Ibáñez para docentes y personal administrativo de la Escuela de Comunicaciones y Periodismo.
+Responde usando SOLO los documentos entregados: el compilado de reglamentos de la promoción indicada y una tabla verificada de quién decide cada trámite en cada promoción (2018 a 2025). Sin conocimiento externo.
 Reglas:
-- Máximo 5 líneas o pasos numerados. Claro y cordial.
-- Cada afirmación normativa debe ir respaldada por una cita LITERAL copiada del documento (entre 8 y 40 palabras, sin modificar ni una palabra), con su página según los marcadores "=== Compilado AAAA | Página N ===".
-- Nombra cargos o unidades, nunca personas. Si te preguntan por el nombre de una persona, di que no está en los documentos y deriva a la unidad.
-- Si la regla depende del año de ingreso y hay más de un compilado con reglas distintas, dilo, resume la diferencia y pide el año de ingreso.
-- Si te piden confirmar algo que el documento contradice, corrígelo con la cita.
-- Si la información no está en los documentos, dilo explícitamente (estado "no_esta") y sugiere a qué unidad derivar.
+- Máximo 4 líneas. Claro y cordial. Usa **negrita** para el dato central.
+- Cada afirmación normativa va respaldada por una cita LITERAL copiada del documento (8 a 40 palabras, sin cambiar ni una palabra), con su año y página según los marcadores "=== Compilado AAAA | Página N ===" o según la tabla.
+- El año que aparece como "visible en el tablero" NO lo indicó el usuario. Si la pregunta no menciona un año de ingreso ni una promoción, y la tabla muestra que la respuesta cambia entre promociones, NO respondas para un solo año: usa estado "falta_año", resume en una o dos líneas cómo cambió (qué años, qué cargo) con citas de la tabla, y pregunta el año de ingreso. Si la pregunta sí menciona un año, responde para ese año.
+- Nombra cargos o unidades, nunca personas. Si piden el nombre de quien ocupa un cargo, di que no está en los documentos.
+- Si te piden confirmar algo que el documento contradice, corrígelo (estado "contradiccion").
+- Si la información no está, dilo (estado "no_esta") y sugiere a qué unidad derivar.
 """
 
-FORMATO_CHAT = """Devuelve SOLO un objeto JSON válido, sin texto adicional, con esta forma:
+FORMATO = """Devuelve SOLO un objeto JSON válido, sin texto adicional:
 {"estado": "respondida" | "parcial" | "falta_año" | "no_esta" | "contradiccion",
- "respuesta": "texto breve en markdown",
- "citas": [{"año": 2025, "reglamento": "nombre del reglamento", "articulo": "Artículo 12", "pagina": 19, "cita": "texto literal copiado del documento"}],
- "derivar_a": "cargo o unidad"}"""
-
-FORMATO_COMPARAR = """Compara cómo responde cada compilado a la pregunta. Devuelve SOLO un objeto JSON válido:
-{"tema": "título corto",
- "por_año": [{"año": 2023, "respuesta": "1 a 3 líneas", "citas": [{"año": 2023, "reglamento": "...", "articulo": "...", "pagina": 15, "cita": "texto literal"}]}],
- "cambio": true | false,
- "que_cambio": "una o dos líneas: qué cambió entre cohortes, o 'Sin cambios' "}
-Incluye una entrada por cada compilado entregado, en orden de año. Si un compilado no trata el tema, dilo en su respuesta y deja citas vacías."""
-
-
-# ---------------------------------------------------------------- llamada al modelo
-def llamar(modelo: str, years: list[int], mensajes: list[dict], formato: str) -> dict:
-    reg = registro()
-    with reg["lock"]:
-        if reg["calls"] >= MAX_CALLS:
-            return {"estado": "error", "respuesta": "Se alcanzó el tope de consultas de la demo.", "citas": []}
-        reg["calls"] += 1
-
-    key = os.environ.get("OPENROUTER_API_KEY") or st.secrets.get("OPENROUTER_API_KEY", None)
-    client = OpenAI(base_url="https://openrouter.ai/api/v1", api_key=key)
-    bloque_docs = {"type": "text", "text": contexto(years)}
-    if modelo.startswith("anthropic/"):
-        bloque_docs["cache_control"] = {"type": "ephemeral"}
-    system = [
-        {"type": "text", "text": INSTRUCCIONES},
-        bloque_docs,
-        {"type": "text", "text": formato},
-    ]
-    try:
-        r = client.chat.completions.create(
-            model=modelo,
-            messages=[{"role": "system", "content": system}, *mensajes],
-            temperature=0,
-            max_tokens=4000,
-            extra_headers={"X-Title": "Demo normativa UAI"},
-            extra_body={"reasoning": {"effort": "low"}, "usage": {"include": True}},
-        )
-        texto = r.choices[0].message.content or ""
-        costo = getattr(r, "usage", None) and (r.usage.model_extra or {}).get("cost")
-        if costo:
-            with reg["lock"]:
-                reg["costo"] = reg.get("costo", 0.0) + float(costo)
-    except Exception as e:  # noqa: BLE001
-        return {"estado": "error", "respuesta": f"Error al consultar el modelo: {e}", "citas": []}
-    return parsear(texto)
+ "respuesta": "texto breve con **negritas**",
+ "citas": [{"año": 2025, "reglamento": "nombre del reglamento", "articulo": "Artículo 47", "pagina": 15, "cita": "texto literal"}],
+ "derivar_a": "cargo o unidad",
+ "foco": {"tramite": "uno de estos id o null: TRAMITES", "año": 2025}}"""
 
 
 def parsear(texto: str) -> dict:
@@ -154,308 +132,185 @@ def parsear(texto: str) -> dict:
     return {"estado": "parcial", "respuesta": texto, "citas": []}
 
 
-# ---------------------------------------------------------------- verificación de citas
-def verificar(cita: dict, years: list[int]) -> dict:
-    """Busca la cita literal en el PDF. Devuelve estado, página real y fragmento resaltado."""
+def llamar(year: int, mensajes: list[dict]) -> dict:
+    reg = registro()
+    with reg["lock"]:
+        if reg["calls"] >= MAX_CALLS:
+            return {"estado": "error", "respuesta": "Se alcanzó el tope de consultas de la demo.", "citas": []}
+        reg["calls"] += 1
+    d = cargar_corpus()[year]
+    docs = f"<<<DOCUMENTO: {d['titulo']} (aplica a quienes ingresaron en {year})>>>\n" + "\n\n".join(
+        f"=== Compilado {year} | Página {p['page']} ===\n{p['text']}" for p in d["pages"]
+    )
+    ids = ", ".join(x["id"] for x in cargar_tablero()["tramites"])
+    system = [
+        {"type": "text", "text": INSTRUCCIONES},
+        {"type": "text", "text": matriz_texto()},
+        {"type": "text", "text": docs, "cache_control": {"type": "ephemeral"}},
+        {"type": "text", "text": FORMATO.replace("TRAMITES", ids)},
+    ]
+    client = OpenAI(base_url="https://openrouter.ai/api/v1", api_key=secreto("OPENROUTER_API_KEY"))
+    try:
+        r = client.chat.completions.create(
+            model=MODELO,
+            messages=[{"role": "system", "content": system}, *mensajes],
+            temperature=0,
+            max_tokens=4000,
+            extra_headers={"X-Title": "Demo normativa UAI"},
+            extra_body={"reasoning": {"effort": "low"}, "usage": {"include": True}},
+        )
+        texto = r.choices[0].message.content or ""
+        costo = (getattr(r, "usage", None) and (r.usage.model_extra or {}).get("cost")) or 0
+        with reg["lock"]:
+            reg["costo"] += float(costo)
+    except Exception as e:  # noqa: BLE001
+        return {"estado": "error", "respuesta": f"No pude consultar el modelo ({type(e).__name__}). Intenta de nuevo.", "citas": []}
+    return parsear(texto)
+
+
+# ---------------------------------------------------------------- verificación de citas (sin IA)
+def verificar(cita: dict, year: int) -> dict:
     corpus = cargar_corpus()
     q = normalizar(str(cita.get("cita", "")))
-    if len(q) < 15:
-        return {"ok": False, "motivo": "sin cita literal"}
     try:
-        y = int(cita.get("año") or years[0])
+        y = int(cita.get("año") or year)
     except (TypeError, ValueError):
-        y = years[0]
+        y = year
     if y not in corpus:
-        y = years[0]
-    pags = corpus[y]["pages"]
+        y = year
+    if len(q) < 15:
+        return {"ok": False, "año": y, "pagina": cita.get("pagina")}
     try:
         pag = int(cita.get("pagina"))
     except (TypeError, ValueError):
         pag = -1
+    pags = corpus[y]["pages"]
+    mejor = (0, None)
+    for p in sorted(pags, key=lambda p: p["page"] != pag):
+        s = fuzz.partial_ratio(q, p["norm"])
+        if s > mejor[0]:
+            mejor = (s, p["page"])
+        if s >= UMBRAL:
+            break
+    return {"ok": mejor[0] >= UMBRAL, "año": y, "pagina": mejor[1] if mejor[0] >= UMBRAL else pag}
 
-    def buscar(p):
-        al = fuzz.partial_ratio_alignment(q, p["norm"])
-        return al.score, al.dest_start, al.dest_end
 
-    candidatas = [p for p in pags if p["page"] == pag] or []
-    mejor = None
-    for p in candidatas:
-        s, a, b = buscar(p)
-        mejor = (s, p, a, b)
-    if not mejor or mejor[0] < UMBRAL:
-        for p in pags:
-            s, a, b = buscar(p)
-            if not mejor or s > mejor[0]:
-                mejor = (s, p, a, b)
-    s, p, a, b = mejor
-    ok = s >= UMBRAL
-    n = p["norm"]
-    frag = (
-        html.escape(n[max(0, a - 220) : a])
-        + "<mark>"
-        + html.escape(n[a:b])
-        + "</mark>"
-        + html.escape(n[b : b + 220])
-    )
+def responder(pregunta: str, year: int, historial: list[dict]) -> dict:
+    msgs = [*historial[-4:], {"role": "user", "content": f"[Promoción visible en el tablero, no indicada por el usuario: {year}] {pregunta}"}]
+    r = llamar(year, msgs)
+    citas = r.get("citas") or []
+    with ThreadPoolExecutor() as ex:
+        verifs = list(ex.map(lambda c: verificar(c, year), citas))
+    citas_out = [
+        {
+            "año": v["año"],
+            "reglamento": c.get("reglamento", ""),
+            "articulo": c.get("articulo", ""),
+            "pagina": v["pagina"],
+            "pagina_real": v["pagina"],
+            "cita": c.get("cita", ""),
+            "verificada": v["ok"],
+        }
+        for c, v in zip(citas, verifs)
+    ]
+    estado = r.get("estado", "parcial")
+    foco = r.get("foco") or {}
+    tram = foco.get("tramite") if foco.get("tramite") in {x["id"] for x in cargar_tablero()["tramites"]} else None
+    foco_out = None
+    if tram:
+        foco_out = {"tramite": tram}
+        try:
+            fy = int(foco.get("año") or year)
+            if 2018 <= fy <= 2025:
+                foco_out["año"] = fy
+        except (TypeError, ValueError):
+            pass
+        if estado == "falta_año":
+            foco_out.update({"vista": "tiempo", "play": True})
+            foco_out.pop("año", None)
+        elif tram in HALLAZGO_POR_TRAMITE:
+            foco_out["hallazgo"] = HALLAZGO_POR_TRAMITE[tram]
+    reg = registro()
+    with reg["lock"]:
+        reg["preguntas"] += 1
+        if estado == "no_esta":
+            reg["sin_respuesta"] += 1
     return {
-        "ok": ok,
-        "score": round(s),
-        "año": y,
-        "pagina_real": p["page"],
-        "pagina_citada": pag,
-        "url": f"{corpus[y]['url']}#page={p['page']}",
-        "fragmento": frag,
+        "estado": estado if estado != "error" else "no_esta",
+        "texto": r.get("respuesta", ""),
+        "citas": citas_out,
+        "derivar": r.get("derivar_a") or "",
+        "foco": foco_out,
+        "live": True,
     }
 
 
-def verificar_todas(citas: list[dict], years: list[int]) -> list[dict]:
-    with ThreadPoolExecutor() as ex:
-        return list(ex.map(lambda c: verificar(c, years), citas))
+# ---------------------------------------------------------------- puerta de entrada
+OCULTAR_STREAMLIT = """<style>
+header[data-testid="stHeader"], [data-testid="stToolbar"], [data-testid="stDecoration"], footer, #MainMenu { display:none !important; }
+.block-container, [data-testid="stMainBlockContainer"] { padding:0 !important; max-width:100% !important; }
+[data-testid="stAppViewContainer"], .stApp { background:#F3F5F8; }
+</style>"""
+
+LOGIN_CSS = """<style>
+[data-testid="stMainBlockContainer"] { max-width:420px !important; margin:12vh auto 0; padding:0 16px !important; }
+.login-mark { width:54px; height:54px; border-radius:14px; background:#009FE3; color:#fff; display:grid; place-items:center; font:800 18px Inter, sans-serif; margin-bottom:18px; box-shadow:0 8px 24px rgba(0,159,227,.35); }
+.login h1 { font:800 26px Inter, sans-serif; color:#15171A; margin:0 0 6px; letter-spacing:-.02em; }
+.login p { font:400 15px Inter, sans-serif; color:#616365; margin:0 0 22px; }
+[data-testid="stForm"] { border:1px solid #E2E6EB !important; background:#fff; border-radius:16px; padding:22px !important; box-shadow:0 6px 24px rgba(21,23,26,.06); }
+.stButton button, [data-testid="stFormSubmitButton"] button { background:#009FE3 !important; color:#fff !important; border:0 !important; border-radius:10px !important; font-weight:700 !important; width:100%; }
+</style>"""
 
 
-# ---------------------------------------------------------------- piezas de interfaz
-ESTADOS = {
-    "respondida": (":green-badge[:material/check_circle: Respondida]"),
-    "parcial": (":orange-badge[:material/rule: Respuesta parcial]"),
-    "falta_año": (":blue-badge[:material/calendar_month: Depende del año de ingreso]"),
-    "no_esta": (":red-badge[:material/search_off: No está en los documentos]"),
-    "contradiccion": (":violet-badge[:material/warning: Contradicción entre documentos]"),
-    "error": (":red-badge[:material/error: Error]"),
-}
-
-
-def mostrar_citas(citas: list[dict], verifs: list[dict]) -> None:
-    for c, v in zip(citas, verifs):
-        etiqueta = f"{c.get('reglamento', 'Reglamento')} | {c.get('articulo', '')} | p. {c.get('pagina', '?')}"
-        if v.get("ok"):
-            badge = ":green-badge[:material/verified: Cita verificada en el PDF]"
-            if v["pagina_real"] != v["pagina_citada"]:
-                badge += f" :orange-badge[página corregida: {v['pagina_real']}]"
-        else:
-            badge = ":red-badge[:material/gpp_bad: Cita no encontrada en el PDF]"
-        with st.expander(f"{etiqueta}"):
-            st.markdown(badge)
-            st.markdown(f"> {c.get('cita', '')}")
-            if v.get("fragmento"):
-                st.caption(f"Texto del compilado {v['año']}, página {v['pagina_real']} (similitud {v['score']}%):")
-                st.markdown(
-                    f"<div style='font-size:0.85rem;line-height:1.5;padding:.6rem;border-radius:6px;"
-                    f"background:rgba(127,127,127,.08)'>…{v['fragmento']}…</div>",
-                    unsafe_allow_html=True,
-                )
-                st.link_button("Abrir PDF oficial en esa página", v["url"], icon=":material/open_in_new:")
-
-
-def mostrar_respuesta(m: dict) -> None:
-    res = m["res"]
-    st.markdown(ESTADOS.get(res.get("estado"), ESTADOS["parcial"]))
-    st.markdown(res.get("respuesta", ""))
-    if res.get("derivar_a"):
-        st.markdown(f"**Derivar a:** {res['derivar_a']}")
-    if res.get("citas"):
-        n_ok = sum(1 for v in m["verifs"] if v.get("ok"))
-        st.caption(f"Fuentes | {n_ok} de {len(m['verifs'])} citas verificadas automáticamente contra el PDF oficial")
-        mostrar_citas(res["citas"], m["verifs"])
-
-
-def anotar_feedback(item_id: str, key: str) -> None:
-    val = st.session_state.get(key)
-    reg = registro()
-    with reg["lock"]:
-        for it in reg["items"]:
-            if it["id"] == item_id:
-                it["feedback"] = {None: "", 0: "negativo", 1: "positivo"}[val]
+def puerta() -> bool:
+    if st.session_state.get("ok"):
+        return True
+    st.markdown(OCULTAR_STREAMLIT + LOGIN_CSS, unsafe_allow_html=True)
+    st.markdown(
+        '<div class="login"><div class="login-mark">UAI</div><h1>Normativa académica</h1>'
+        "<p>Prototipo del Grupo 15 ConectIA | demo CENIA. Ingresa la clave que te compartieron.</p></div>",
+        unsafe_allow_html=True,
+    )
+    with st.form("login"):
+        clave = st.text_input("Clave", type="password", placeholder="Clave de acceso")
+        if st.form_submit_button("Entrar"):
+            if clave.strip() == CLAVE_APP:
+                st.session_state.ok = True
+                st.rerun()
+            st.error("Clave incorrecta.")
+    return False
 
 
 # ---------------------------------------------------------------- app
-corpus = cargar_corpus()
-YEARS = sorted(corpus)
+if not puerta():
+    st.stop()
 
-with st.sidebar:
-    st.markdown("### :material/gavel: Normativa UAI")
-    st.caption("Demo CENIA | Micropráctica 3 | ConectIA 2026")
-    modelo = st.selectbox("Modelo (vía OpenRouter)", MODELOS, index=0)
-    st.divider()
-    st.markdown("**Cómo funciona**")
-    st.markdown(
-        "1. El modelo lee el compilado completo de reglamentos de la cohorte.\n"
-        "2. Responde y copia frases literales como respaldo.\n"
-        "3. La app busca cada frase en el PDF oficial, **sin IA**, y marca si existe y en qué página."
-    )
-    st.divider()
-    st.caption("Documentos: compilados oficiales de reglamentos de pregrado UAI " + ", ".join(map(str, YEARS)) + ". Sin datos de estudiantes.")
+st.markdown(OCULTAR_STREAMLIT, unsafe_allow_html=True)
 
-tab_chat, tab_comp, tab_panel = st.tabs(
-    [":material/chat: Asistente", ":material/compare_arrows: Comparar cohortes", ":material/dashboard: Panel"]
+tablero = st.components.v2.component(
+    "tablero_normativa",
+    html=(UI / "tablero.html").read_text(encoding="utf-8"),
+    css=(UI / "tablero.css").read_text(encoding="utf-8"),
+    js=(UI / "tablero.js").read_text(encoding="utf-8"),
 )
 
-# ---------------- asistente
-with tab_chat:
-    st.markdown("#### Pregúntale a los reglamentos")
-    opciones = [str(y) for y in reversed(YEARS)] + ["No lo sé"]
-    anio = st.segmented_control("Año de ingreso del estudiante", opciones, default=opciones[0], key="anio")
-    anio = anio or opciones[0]
-    years = YEARS if anio == "No lo sé" else [int(anio)]
+reg = registro()
+res = tablero(
+    data={
+        "base": cargar_tablero(),
+        "respuesta": st.session_state.get("ultima"),
+        "stats": {"sin_respuesta": reg["sin_respuesta"], "preguntas": reg["preguntas"]},
+    },
+    key="tablero",
+    on_pregunta_change=lambda: None,
+)
 
-    ejemplos = [
-        "¿Quién aprueba una convalidación de asignaturas?",
-        "Un estudiante faltó a una prueba por enfermedad. ¿Qué plazo tiene para justificar?",
-        "Confírmame que un estudiante puede suspender 3 semestres",
-        "¿Un estudiante puede usar IA en un trabajo?",
-        "¿Cuál es el horario de atención de la Secretaría Académica?",
-    ]
-    ej = st.pills("Ejemplos", ejemplos, key="ej", label_visibility="collapsed")
-
-    if "msgs" not in st.session_state:
-        st.session_state.msgs = []
-
-    for m in st.session_state.msgs:
-        with st.chat_message(m["role"]):
-            if m["role"] == "user":
-                st.markdown(m["content"])
-            else:
-                mostrar_respuesta(m)
-                k = f"fb_{m['id']}"
-                st.feedback("thumbs", key=k, on_change=anotar_feedback, args=(m["id"], k))
-
-    pregunta = st.chat_input("Escribe tu pregunta sobre reglamentos de pregrado")
-    if ej and not pregunta and st.session_state.get("_ultimo_ej") != ej:
-        pregunta = ej
-    st.session_state["_ultimo_ej"] = ej
-
-    if pregunta:
-        st.session_state.msgs.append({"role": "user", "content": pregunta})
-        with st.chat_message("user"):
-            st.markdown(pregunta)
-        with st.chat_message("assistant"):
-            with st.status("Leyendo el compilado y verificando citas…", expanded=False) as s:
-                historial = []
-                for m in st.session_state.msgs[-7:]:
-                    if m["role"] == "user":
-                        historial.append({"role": "user", "content": m["content"]})
-                    else:
-                        historial.append({"role": "assistant", "content": json.dumps(m["res"], ensure_ascii=False)})
-                historial[-1] = {
-                    "role": "user",
-                    "content": f"[Año de ingreso indicado: {anio}] {pregunta}",
-                }
-                res = llamar(modelo, years, historial, FORMATO_CHAT)
-                verifs = verificar_todas(res.get("citas") or [], years)
-                s.update(label="Listo", state="complete")
-            item = {"id": uuid.uuid4().hex[:8], "role": "assistant", "res": res, "verifs": verifs}
-            mostrar_respuesta(item)
-            k = f"fb_{item['id']}"
-            st.feedback("thumbs", key=k, on_change=anotar_feedback, args=(item["id"], k))
-        st.session_state.msgs.append(item)
-        reg = registro()
-        with reg["lock"]:
-            reg["items"].append(
-                {
-                    "id": item["id"],
-                    "hora": dt.datetime.now().strftime("%H:%M"),
-                    "pregunta": pregunta,
-                    "año": anio,
-                    "estado": res.get("estado", ""),
-                    "citas": len(verifs),
-                    "verificadas": sum(1 for v in verifs if v.get("ok")),
-                    "modelo": modelo,
-                    "feedback": "",
-                }
-            )
-
-# ---------------- comparar cohortes
-with tab_comp:
-    st.markdown("#### La misma pregunta, tres cohortes")
-    st.caption("La normativa cambia según el año de ingreso. Aquí se ve qué dice cada compilado, lado a lado, con sus citas verificadas.")
-    temas = [
-        "¿Cuántos semestres puede suspender un estudiante?",
-        "¿Cuántas veces puede anular asignaturas un estudiante?",
-        "¿Qué plazo tiene un estudiante para justificar una inasistencia a una prueba?",
-        "¿Qué porcentaje de créditos se puede convalidar?",
-    ]
-    c1, c2 = st.columns([3, 1])
-    tema = c1.selectbox("Pregunta", temas, accept_new_options=True, key="tema")
-    ir = c2.button("Comparar", type="primary", width="stretch", icon=":material/compare_arrows:")
-    if ir and tema:
-        with st.status("Leyendo los tres compilados…") as s:
-            res = llamar(modelo, YEARS, [{"role": "user", "content": tema}], FORMATO_COMPARAR)
-            por = res.get("por_año") or []
-            verifs = [verificar_todas(e.get("citas") or [], [int(e.get("año", YEARS[0]))]) for e in por]
-            s.update(label="Listo", state="complete")
-        st.session_state.comp = {"tema": tema, "res": res, "verifs": verifs}
-        reg = registro()
-        with reg["lock"]:
-            reg["items"].append(
-                {
-                    "id": uuid.uuid4().hex[:8],
-                    "hora": dt.datetime.now().strftime("%H:%M"),
-                    "pregunta": f"[Comparar] {tema}",
-                    "año": "todos",
-                    "estado": "cambio" if res.get("cambio") else "sin cambio",
-                    "citas": sum(len(v) for v in verifs),
-                    "verificadas": sum(1 for vs in verifs for v in vs if v.get("ok")),
-                    "modelo": modelo,
-                    "feedback": "",
-                }
-            )
-    comp = st.session_state.get("comp")
-    if comp:
-        res = comp["res"]
-        if res.get("estado") == "error":
-            st.error(res.get("respuesta"))
-        else:
-            if res.get("cambio"):
-                st.warning(f"**Cambió entre cohortes.** {res.get('que_cambio', '')}", icon=":material/change_circle:")
-            else:
-                st.success(f"**Sin cambios entre cohortes.** {res.get('que_cambio', '')}", icon=":material/check_circle:")
-            cols = st.columns(max(1, len(res.get("por_año") or [])))
-            for col, e, vs in zip(cols, res.get("por_año") or [], comp["verifs"]):
-                with col.container(border=True):
-                    st.markdown(f"##### Ingreso {e.get('año')}")
-                    st.markdown(e.get("respuesta", ""))
-                    if e.get("citas"):
-                        mostrar_citas(e["citas"], vs)
-
-# ---------------- panel
-with tab_panel:
-    reg = registro()
-    with reg["lock"]:
-        items = list(reg["items"])
-    st.markdown("#### Panel del asistente")
-    st.caption("Compartido en vivo entre todas las personas conectadas. Solo guarda la pregunta, nunca quién la hizo.")
-    m1, m2, m3, m4, m5 = st.columns(5)
-    total_c = sum(i["citas"] for i in items)
-    ok_c = sum(i["verificadas"] for i in items)
-    m1.metric("Preguntas", len(items))
-    m2.metric("Citas verificadas", f"{(100 * ok_c / total_c):.0f}%" if total_c else "—")
-    m3.metric("Sin respuesta en documentos", sum(1 for i in items if i["estado"] == "no_esta"))
-    m4.metric("Pulgar abajo", sum(1 for i in items if i["feedback"] == "negativo"))
-    m5.metric("Gasto del modelo", f"US$ {reg.get('costo', 0.0):.2f}")
-
-    st.markdown("##### Registro de fallas")
-    st.caption("Preguntas que los documentos no responden o que alguien marcó como incorrectas. Es la lista de trabajo para quien mantiene los documentos.")
-    fallas = [i for i in items if i["estado"] == "no_esta" or i["feedback"] == "negativo" or (i["citas"] and i["verificadas"] < i["citas"])]
-    if fallas:
-        st.dataframe(pd.DataFrame(fallas)[["hora", "pregunta", "año", "estado", "verificadas", "citas", "feedback"]], hide_index=True, width="stretch")
-    else:
-        st.info("Sin fallas registradas todavía.")
-
-    st.markdown("##### Todas las preguntas")
-    if items:
-        st.dataframe(pd.DataFrame(items)[["hora", "pregunta", "año", "estado", "verificadas", "citas", "modelo", "feedback"]].iloc[::-1], hide_index=True, width="stretch")
-    else:
-        st.info("Aún no hay preguntas.")
-
-    st.markdown("##### Documentos cargados")
-    st.dataframe(
-        pd.DataFrame(
-            [
-                {"documento": d["titulo"], "cohorte": y, "páginas": len(d["pages"]), "enlace": d["url"]}
-                for y, d in sorted(corpus.items(), reverse=True)
-            ]
-        ),
-        hide_index=True,
-        width="stretch",
-        column_config={"enlace": st.column_config.LinkColumn("enlace", display_text="Abrir PDF")},
-    )
-    st.button("Actualizar panel", icon=":material/refresh:")
+p = getattr(res, "pregunta", None)
+if p and p.get("id") != st.session_state.get("procesada"):
+    st.session_state.procesada = p["id"]
+    hist = st.session_state.setdefault("historial", [])
+    out = responder(p["q"], int(p.get("año") or 2025), hist)
+    out["id"] = p["id"]
+    hist += [{"role": "user", "content": p["q"]}, {"role": "assistant", "content": out["texto"]}]
+    st.session_state.ultima = out
+    st.rerun()

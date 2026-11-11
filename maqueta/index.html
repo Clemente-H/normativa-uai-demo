@@ -485,15 +485,15 @@ function answer(r) {
       if (n >= full.length) {
         clearInterval(tick);
         txt.innerHTML = full.replace(/\*\*(.+?)\*\*/g, "<b>$1</b>");
-        (r.citas || []).forEach(c => { const it = item(c.año, c.id); if (!it || !it.cita) return; d.insertAdjacentHTML("beforeend", `<div class="cite"><div>${it.verificada ? '<span class="tag ok">Cita verificada en el PDF</span>' : '<span class="tag bad">Cita no encontrada</span>'}</div><div>"${esc(it.cita)}"</div><div class="meta">${esc(it.reglamento || "")} ${c.año} | ${esc(it.articulo || "")} | p. ${it.pagina_real || it.pagina}</div></div>`); });
+        (r.citas || []).forEach(c => { const it = c.cita ? c : item(c.año, c.id); if (!it || !it.cita) return; d.insertAdjacentHTML("beforeend", `<div class="cite"><div>${it.verificada ? '<span class="tag ok">Cita verificada en el PDF</span>' : '<span class="tag bad">Cita no encontrada</span>'}</div><div>"${esc(it.cita)}"</div><div class="meta">${esc(it.reglamento || "")}${String(it.reglamento || "").includes(String(c.año)) ? "" : " " + c.año} | ${esc(it.articulo || "")} | p. ${it.pagina_real || it.pagina} <a target="_blank" rel="noopener" href="${pdf(c.año, it.pagina_real || it.pagina)}">abrir PDF</a></div></div>`); });
         if (r.derivar) d.insertAdjacentHTML("beforeend", `<div class="meta"><b>Derivar a:</b> ${esc(r.derivar)}</div>`);
         if (r.foco) d.insertAdjacentHTML("beforeend", `<div><button class="btn">Mostrar en el tablero</button></div>`), d.querySelector("button.btn").onclick = () => mover(r.foco);
         msgs.scrollTop = msgs.scrollHeight;
         if (r.estado === "no_esta") { const k = document.getElementById("kFail"); k.textContent = +k.textContent + 1; const kp = document.getElementById("kpiFail"); kp.classList.remove("bump"); void kp.offsetWidth; kp.classList.add("bump"); }
         if (r.foco) setTimeout(() => mover(r.foco), 400);
       }
-    }, 18);
-  }, 900);
+    }, 14);
+  }, r.live ? 150 : 900);
 }
 function mover(f) {
   stopPlay();

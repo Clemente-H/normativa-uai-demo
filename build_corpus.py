@@ -14,6 +14,11 @@ URLS = {
     2025: "https://uai.cdn7pm.net/documentos/reglamentos-academicos-2025.pdf",
     2024: "https://alumno.uai.cl/assets/uploads/2024/04/reglamentos-uai-2024.pdf",
     2023: "https://alumno.uai.cl/assets/uploads/2023/01/reglamentos-uai-2023.pdf",
+    2022: "https://alumno.uai.cl/assets/uploads/2022/01/reglamento_2022.pdf",
+    2021: "https://alumno.uai.cl/assets/uploads/sites/3/2021/09/reglamentos-2021.pdf",
+    2020: "https://alumno.uai.cl/assets/uploads/sites/3/2020/03/reglamentos-2020.pdf",
+    2019: "https://alumno.uai.cl/assets/uploads/sites/2/2019/01/reglamentos-2019-vf.pdf",
+    2018: "https://alumno.uai.cl/assets/uploads/sites/2/2018/05/reglamento_2018.pdf",
 }
 
 
